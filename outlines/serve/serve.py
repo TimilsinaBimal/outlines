@@ -25,17 +25,36 @@
 # limitations under the License.
 import argparse
 import json
-from typing import AsyncGenerator
+import time
+from typing import AsyncGenerator, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 
 from outlines.integrations.vllm import JSONLogitsProcessor, RegexLogitsProcessor
+
+
+# data models
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: Optional[str] = "Phi-3-Mini-128K"
+    messages: List[Message]
+    max_tokens: Optional[int] = 512
+    temperature: Optional[float] = 0.1
+    stream: Optional[bool] = False
+    response_type: Optional[dict] = {"type": "text"}
+    vllm_args: Optional[dict] = {}
+
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 TIMEOUT_TO_PREVENT_DEADLOCK = 1  # seconds.
@@ -49,8 +68,21 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
-@app.post("/generate")
-async def generate(request: Request) -> Response:
+def process_chat_message(messages: list) -> str:
+    prompt = "<s>"
+    for message in messages:
+        if message.get("role") == "system":
+            prompt += "<|system|>\n" + message.get("content") + "\n<|end|>\n"
+        if message.get("role") == "user":
+            prompt += (
+                "<|user|>\n" + message.get("content") + "\n<|end|>\n<|assistant|>\n"
+            )
+
+    return prompt
+
+
+@app.post("/chat/completion/")
+async def generate(cmp_request: ChatCompletionRequest, request: Request) -> Response:
     """Generate completion for the request.
 
     The request should be a JSON object with the following fields:
@@ -62,33 +94,62 @@ async def generate(request: Request) -> Response:
     """
     assert engine is not None
 
-    request_dict = await request.json()
-    prompt = request_dict.pop("prompt")
-    stream = request_dict.pop("stream", False)
+    messages = cmp_request.messages
+    stream = cmp_request.stream
+    prompt = process_chat_message(messages)
 
-    json_schema = request_dict.pop("schema", None)
-    regex_string = request_dict.pop("regex", None)
-    if json_schema is not None:
+    response_type_dict = cmp_request.response_type
+    response_type = response_type_dict.get("type", "text")
+    logits_processors = []
+
+    if response_type == "json_object":
+        json_schema = response_type_dict.get("schema", None)
+        if not json_schema:
+            return JSONResponse(
+                status_code=500,
+                content="schema required when response_type is json_object",
+            )
+
         logits_processors = [JSONLogitsProcessor(json_schema, engine.engine)]
-    elif regex_string is not None:
+
+    elif response_type == "regex":
+        regex_string = response_type_dict.get("regex", None)
+        if not regex_string:
+            return JSONResponse(
+                status_code=500, content="regex required when response_type is regex"
+            )
         logits_processors = [RegexLogitsProcessor(regex_string, engine.engine)]
-    else:
-        logits_processors = []
 
     sampling_params = SamplingParams(
-        **request_dict, logits_processors=logits_processors  # type: ignore
+        **cmp_request.vllm_args,
+        logits_processors=logits_processors,
+        max_tokens=cmp_request.max_tokens,
+        temperature=cmp_request.temperature,
     )
-    request_id = random_uuid()
+    request_id = "cmpl-" + random_uuid()
 
     results_generator = engine.generate(prompt, sampling_params, request_id)  # type: ignore
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
         async for request_output in results_generator:
-            prompt = request_output.prompt
-            text_outputs = [prompt + output.text for output in request_output.outputs]
-            ret = {"text": text_outputs}
-            yield (json.dumps(ret) + "\0").encode("utf-8")
+            text_outputs = [output.text for output in request_output.outputs]
+            # ret = {"text": text_outputs}
+            chunk = {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": time.time(),
+                "model": cmp_request.model,
+                "choices": [
+                    {
+                        "message": Message(
+                            role="assistant", content=json.dumps(text_outputs)
+                        )
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
 
     if stream:
         return StreamingResponse(stream_results())
@@ -103,10 +164,16 @@ async def generate(request: Request) -> Response:
         final_output = request_output
 
     assert final_output is not None
-    prompt = final_output.prompt
-    text_outputs = [prompt + output.text for output in final_output.outputs]
-    ret = {"text": text_outputs}
-    return JSONResponse(ret)
+    text_outputs = [output.text for output in final_output.outputs]
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": time.time(),
+        "model": cmp_request.model,
+        "choices": [
+            {"message": Message(role="assistant", content=json.dumps(text_outputs))}
+        ],
+    }
 
 
 if __name__ == "__main__":
